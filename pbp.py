@@ -1,7 +1,7 @@
 import os
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Sequence
 
 import datetime
 from nba_api.stats.endpoints import playbyplayv3, leaguegamefinder
@@ -21,7 +21,7 @@ def get_games(n_teams=None) -> pl.DataFrame:
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         df = pl.read_parquet(cache_path)
-        print(f"Loading cached games from {cache_path}")
+        print(f"Loading cached game list from {cache_path}")
         return df
 
     except FileNotFoundError:
@@ -67,7 +67,7 @@ def get_games(n_teams=None) -> pl.DataFrame:
 
 
 def get_raw_pbp(
-    game_id: str | Iterable[str],
+    game_id: str | Sequence[str],
     sleep=0,
 ) -> pl.DataFrame:
     if isinstance(game_id, str):
@@ -85,9 +85,17 @@ def get_raw_pbp(
             time.sleep(sleep)
             return df
 
+    scraped_ids = set(path[4:-8] for path in os.listdir(CACHE_DIR) if "pbp" in path)
+    unscraped_ids = list(set(game_id) - scraped_ids)
+
+    print(
+        f"Scraping {len(unscraped_ids)} games",
+        f"({len(game_id) - len(unscraped_ids)} already scraped)",
+    )
+
     plays_by_game = (
         get_raw_pbp(id, sleep=sleep)
-        for id in tqdm(game_id, desc="Fetching raw play-by-play")
+        for id in tqdm(unscraped_ids, desc="Fetching raw play-by-play")
     )
 
     return pl.concat(plays_by_game, how="vertical_relaxed")
@@ -126,7 +134,7 @@ if __name__ == "__main__":
     N_GAMES = None
 
     games = get_games(n_teams=N_TEAMS)
-    game_ids = games["GAME_ID"][:N_GAMES]
+    game_ids = games["GAME_ID"][:N_GAMES].to_list()
 
     raw_pbp = get_raw_pbp(game_ids, sleep=5)
     pbp = clean_pbp(raw_pbp)
