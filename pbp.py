@@ -1,17 +1,31 @@
 import os
+import time
 from pathlib import Path
 from typing import Iterable
 
+import datetime
 from nba_api.stats.endpoints import playbyplayv3, leaguegamefinder
 from nba_api.stats.static.teams import get_teams
 import polars as pl
-from polars.dependencies import hvplot
 from tqdm import tqdm
 
 
-def get_games() -> pl.DataFrame:
-    teams = get_teams()
+CACHE_DIR = Path(".cache")
+
+
+def get_games(n_teams=None) -> pl.DataFrame:
+    teams = get_teams()[:n_teams]
     team_abbreviations = [t["abbreviation"] for t in teams]
+    cache_path = CACHE_DIR / f"games-{n_teams}-{datetime.date.today()}.parquet"
+
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df = pl.read_parquet(cache_path)
+        print(f"Loading cached games from {cache_path}")
+        return df
+
+    except FileNotFoundError:
+        pass
 
     games_by_team = [
         pl.from_pandas(
@@ -47,24 +61,33 @@ def get_games() -> pl.DataFrame:
 
     print(f"Found {len(games)} games with play-by-play data")
 
+    games.write_parquet(cache_path)
+
     return games
 
 
-def get_raw_pbp(game_id: str | Iterable[str], cache_dir=Path(".cache")) -> pl.DataFrame:
+def get_raw_pbp(
+    game_id: str | Iterable[str],
+    sleep=0,
+) -> pl.DataFrame:
     if isinstance(game_id, str):
+        cache_path = CACHE_DIR / (f"pbp-{game_id}.parquet")
+
         try:
-            os.makedirs(cache_dir, exist_ok=True)
-            return pl.read_parquet(cache_dir / (game_id + ".parquet"))
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            return pl.read_parquet(cache_path)
 
         except FileNotFoundError:
             df: pl.DataFrame = pl.from_pandas(
                 playbyplayv3.PlayByPlayV3(game_id).get_data_frames()[0]
             )
-            df.write_parquet(cache_dir / (game_id + ".parquet"))
+            df.write_parquet(cache_path)
+            time.sleep(sleep)
             return df
 
     plays_by_game = (
-        get_raw_pbp(id) for id in tqdm(game_id, desc="Fetching raw play-by-play")
+        get_raw_pbp(id, sleep=sleep)
+        for id in tqdm(game_id, desc="Fetching raw play-by-play")
     )
 
     return pl.concat(plays_by_game, how="vertical_relaxed")
@@ -99,13 +122,11 @@ def clean_pbp(raw_pbp: pl.DataFrame) -> pl.DataFrame:
 
 
 if __name__ == "__main__":
-    N_GAMES = 100
+    N_TEAMS = None
+    N_GAMES = None
 
-    games = get_games()
+    games = get_games(n_teams=N_TEAMS)
     game_ids = games["GAME_ID"][:N_GAMES]
 
-    raw_pbp = get_raw_pbp(game_ids)
+    raw_pbp = get_raw_pbp(game_ids, sleep=5)
     pbp = clean_pbp(raw_pbp)
-
-    # plot = pbp.drop_nulls(["x", "y"]).plot.scatter(x="x", y="y")
-    # hvplot.show(plot)
