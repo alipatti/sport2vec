@@ -9,6 +9,8 @@ from nba_api.stats.static.teams import get_teams
 import polars as pl
 import typer
 from rich.progress import track
+from rich.status import Status
+from rich import print
 
 
 CACHE_DIR = Path(".cache")
@@ -40,7 +42,7 @@ def scrape_games() -> pl.DataFrame:
     games: pl.DataFrame = (
         pl.concat(games_by_team, how="vertical_relaxed")
         .with_columns(
-            pl.col("GAME_DATE").str.to_date(),
+            pl.col("GAME_DATE").str.to_date().alias("DATE"),
             pl.col("MATCHUP").str.split(" ").list.to_struct().alias("MATCHUP_SPLIT"),
             pl.col("SEASON_ID").str.slice(-4).str.to_integer().alias("SEASON_YEAR"),
         )
@@ -57,7 +59,13 @@ def scrape_games() -> pl.DataFrame:
         .unique("GAME_ID")  # count each game only once
         .sort("GAME_DATE")  # sort by date
         .reverse()
-        .select("GAME_DATE", "HOME", "AWAY", "GAME_ID", "SEASON_YEAR")
+        .select(
+            "DATE",
+            "HOME",
+            "AWAY",
+            pl.col("GAME_ID").alias("ID"),
+            "SEASON_YEAR",
+        )
     )
 
     print(f"Found {len(games)} games with play-by-play data")
@@ -68,21 +76,23 @@ def scrape_games() -> pl.DataFrame:
 
 
 def scrape_raw_pbp(
-    game_ids: Sequence[str],
+    games: pl.DataFrame,
     delay,
     verbose=False,
 ):
     os.makedirs(CACHE_DIR / "pbp-raw", exist_ok=True)
 
-    for id in track(
-        game_ids,
-        description=f"Scraping pbp from {len(game_ids)} games...",
+    for game in track(
+        games.rows(named=True),
+        description=f"Scraping pbp from {len(games)} games...",
     ):
+        id = game["ID"]
+        game_name = f"{game['HOME']} vs. {game['AWAY']} ({str(game['DATE'])})"
+
         cache_path = CACHE_DIR / "pbp-raw" / (f"{id}.parquet")
 
         if os.path.exists(cache_path):
-            if verbose:
-                print(f"Skipping previously scraped game {id}")
+            print(f"Skipped: {game_name}")
             continue
 
         try:
@@ -90,11 +100,11 @@ def scrape_raw_pbp(
             df.write_parquet(cache_path)
 
             if verbose:
-                print(f"Successfully scraped game {id}")
+                print(f"[green][b]Scraped:[/b][/green] {game_name}")
 
         except Exception:
             if verbose:
-                print(f"Failed to scrape game {id}")
+                print(f"[red][b]Failed:[/b][/red] {game_name}")
 
         time.sleep(delay)
 
@@ -138,9 +148,11 @@ def clean_raw_pbp(raw_pbp: pl.DataFrame) -> pl.DataFrame:
 def scrape(delay: float = 0.6, verbose: bool = False, n_games: Union[int, None] = None):
     games = scrape_games()
 
-    game_ids = games["GAME_ID"][:n_games].to_list()
-
-    scrape_raw_pbp(game_ids, delay=delay, verbose=verbose)
+    scrape_raw_pbp(
+        games.head(n_games) if n_games else games,
+        delay=delay,
+        verbose=verbose,
+    )
 
 
 if __name__ == "__main__":
