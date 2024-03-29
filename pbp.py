@@ -1,25 +1,28 @@
 import os
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, Union
 
 import datetime
-from nba_api.stats.endpoints import playbyplayv3, leaguegamefinder
+from nba_api.stats.endpoints import PlayByPlayV3, LeagueGameFinder
 from nba_api.stats.static.teams import get_teams
 import polars as pl
-from tqdm import tqdm
+import typer
+from rich.progress import track
 
 
 CACHE_DIR = Path(".cache")
 
+app = typer.Typer()
 
-def get_games(n_teams=None) -> pl.DataFrame:
-    teams = get_teams()[:n_teams]
+
+def scrape_games() -> pl.DataFrame:
+    teams = get_teams()
     team_abbreviations = [t["abbreviation"] for t in teams]
-    cache_path = CACHE_DIR / f"games-{n_teams}-{datetime.date.today()}.parquet"
+    cache_path = CACHE_DIR / "games" / f"{datetime.date.today()}.parquet"
 
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(CACHE_DIR / "games", exist_ok=True)
         df = pl.read_parquet(cache_path)
         print(f"Loading cached game list from {cache_path}")
         return df
@@ -29,11 +32,9 @@ def get_games(n_teams=None) -> pl.DataFrame:
 
     games_by_team = [
         pl.from_pandas(
-            leaguegamefinder.LeagueGameFinder(
-                team_id_nullable=team["id"]
-            ).get_data_frames()[0]
+            LeagueGameFinder(team_id_nullable=team["id"]).get_data_frames()[0]
         )
-        for team in tqdm(teams, desc="Fetching games by team", leave=False)
+        for team in track(teams, description="Fetching games by team")
     ]
 
     games: pl.DataFrame = (
@@ -66,42 +67,46 @@ def get_games(n_teams=None) -> pl.DataFrame:
     return games
 
 
-def get_raw_pbp(
-    game_id: str | Sequence[str],
-    sleep=0,
-) -> pl.DataFrame:
-    if isinstance(game_id, str):
-        cache_path = CACHE_DIR / (f"pbp-{game_id}.parquet")
+def scrape_raw_pbp(
+    game_ids: Sequence[str],
+    delay,
+    verbose=False,
+):
+    os.makedirs(CACHE_DIR / "pbp-raw", exist_ok=True)
+
+    for id in track(
+        game_ids,
+        description=f"Scraping pbp from {len(game_ids)} games...",
+    ):
+        cache_path = CACHE_DIR / "pbp-raw" / (f"{id}.parquet")
+
+        if os.path.exists(cache_path):
+            if verbose:
+                print(f"Skipping previously scraped game {id}")
+            continue
 
         try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            return pl.read_parquet(cache_path)
-
-        except FileNotFoundError:
-            df: pl.DataFrame = pl.from_pandas(
-                playbyplayv3.PlayByPlayV3(game_id).get_data_frames()[0]
-            )
+            df = pl.from_pandas(PlayByPlayV3(id).get_data_frames()[0])
             df.write_parquet(cache_path)
-            time.sleep(sleep)
-            return df
 
-    scraped_ids = set(path[4:-8] for path in os.listdir(CACHE_DIR) if "pbp" in path)
-    unscraped_ids = list(set(game_id) - scraped_ids)
+            if verbose:
+                print(f"Successfully scraped game {id}")
 
-    print(
-        f"Scraping {len(unscraped_ids)} games",
-        f"({len(game_id) - len(unscraped_ids)} already scraped)",
-    )
+        except Exception:
+            if verbose:
+                print(f"Failed to scrape game {id}")
 
-    plays_by_game = (
-        get_raw_pbp(id, sleep=sleep)
-        for id in tqdm(unscraped_ids, desc="Fetching raw play-by-play")
-    )
-
-    return pl.concat(plays_by_game, how="vertical_relaxed")
+        time.sleep(delay)
 
 
-def clean_pbp(raw_pbp: pl.DataFrame) -> pl.DataFrame:
+def load_raw_pbp() -> pl.DataFrame:
+    paths = os.listdir(CACHE_DIR / "pbp-raw")
+    dfs = (pl.read_parquet(fp) for fp in paths)
+
+    return pl.concat(dfs, how="vertical_relaxed")
+
+
+def clean_raw_pbp(raw_pbp: pl.DataFrame) -> pl.DataFrame:
     return (
         raw_pbp.with_columns(
             pl.col(pl.Utf8).replace("", None).replace("Unknown", None),
@@ -129,12 +134,17 @@ def clean_pbp(raw_pbp: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+@app.command()
+def scrape(delay: float = 0.6, verbose: bool = False, n_games: Union[int, None] = None):
+    games = scrape_games()
+
+    game_ids = games["GAME_ID"][:n_games].to_list()
+
+    scrape_raw_pbp(game_ids, delay=delay, verbose=verbose)
+
+
 if __name__ == "__main__":
-    N_TEAMS = None
-    N_GAMES = None
+    app()
 
-    games = get_games(n_teams=N_TEAMS)
-    game_ids = games["GAME_ID"][:N_GAMES].to_list()
-
-    raw_pbp = get_raw_pbp(game_ids, sleep=5)
-    pbp = clean_pbp(raw_pbp)
+    # raw_pbp = load_raw_pbp()
+    # pbp = clean_raw_pbp(raw_pbp)
