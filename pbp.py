@@ -15,7 +15,7 @@ from rich.status import Status
 from rich import print
 
 
-DATA_DIRECTORY = Path(".cache")
+DATA_DIRECTORY = Path("data")
 
 TEAMS = pl.from_dicts(get_teams())
 PLAYERS = pl.from_dicts(get_players())
@@ -133,21 +133,16 @@ def scrape_raw_pbp(
 
 
 def load_raw_pbp(n_games: int | None = None) -> pl.LazyFrame:
-    paths = os.listdir(DATA_DIRECTORY / "pbp-raw")[:n_games]
+    paths = list((DATA_DIRECTORY / "pbp-raw").glob("*.parquet"))[:n_games]
 
     dfs = [
-        pl.scan_parquet(DATA_DIRECTORY / "pbp-raw" / fp)
+        pl.scan_parquet(fp)
         for fp in track(
             paths, description=f"Loading {len(paths)} individual games", transient=True
         )
     ]
 
-    s = Status("Concatenating dataframes")
-    s.start()
-    df = pl.concat(dfs, how="vertical_relaxed")
-    s.stop()
-
-    return df
+    return pl.concat(dfs, how="vertical_relaxed")
 
 
 def clean_raw_pbp(raw_pbp: pl.LazyFrame, games: pl.DataFrame) -> pl.DataFrame:
@@ -221,7 +216,7 @@ def clean(
     s = Status("Writing output...")
     s.start()
     outfile = outfile.format(n_games=pbp["gameId"].unique().len())
-    dir, filename = outfile.rsplit("/", maxsplit=1)
+    dir, _ = outfile.rsplit("/", maxsplit=1)
     os.makedirs(dir, exist_ok=True)
     pbp.write_parquet(outfile)
     s.stop()
