@@ -81,8 +81,19 @@ def scrape_raw_pbp(
     games: pl.DataFrame,
     delay,
     verbose=False,
+    retry_failed=False,
 ):
     os.makedirs(DATA_DIRECTORY / "pbp-raw", exist_ok=True)
+
+    # make file storing ids of failed scrapes
+    failed_path = DATA_DIRECTORY / "pbp-raw" / "_failed.txt"
+
+    if not os.path.exists(failed_path):
+        failed_file = open(failed_path, "w+")
+    else:
+        failed_file = open(failed_path, "r+")
+
+    failed_set = failed_file.read().split()
 
     for game in track(
         games.rows(named=True),
@@ -94,7 +105,13 @@ def scrape_raw_pbp(
         cache_path = DATA_DIRECTORY / "pbp-raw" / (f"{id}.parquet")
 
         if os.path.exists(cache_path):
-            print(f"Skipped: {game_name}")
+            if verbose:
+                print(f"[cyan]Previously scraped[/cyan]: {game_name}")
+            continue
+
+        if id in failed_set and not retry_failed:
+            if verbose:
+                print(f"[red]Previously failed[/red]: {game_name}")
             continue
 
         try:
@@ -105,10 +122,14 @@ def scrape_raw_pbp(
                 print(f"[green][b]Scraped:[/b][/green] {game_name}")
 
         except Exception:
+            failed_file.write(id + "\n")
+
             if verbose:
                 print(f"[red][b]Failed:[/b][/red] {game_name}")
 
         time.sleep(delay)
+
+    failed_file.close()
 
 
 def load_raw_pbp(n_games: int | None = None) -> pl.LazyFrame:
