@@ -13,6 +13,7 @@ import typer
 from rich.progress import track
 from rich.status import Status
 from rich import print
+import inflection
 
 
 DATA_DIRECTORY = Path("data")
@@ -151,38 +152,42 @@ def clean_raw_pbp(raw_pbp: pl.LazyFrame, games: pl.DataFrame) -> pl.DataFrame:
         .join(TEAMS.lazy(), left_on="teamId", right_on="id")
         .join(PLAYERS.lazy(), left_on="personId", right_on="id")
         .with_columns(
-            pl.col(pl.Utf8).replace("", None).replace("Unknown", None),
+            pl.col(pl.String)
+            .replace(["", " ", "Unknown"], None)
+            .str.to_uppercase()
+            .str.replace_all(" |-", "_")
         )
-        .filter(pl.col("actionType") != "period")
+        .rename(inflection.underscore)
+        .filter(pl.col("action_type") != "period")
         .select(
             # game info
-            pl.col("gameId"),
+            pl.col("game_id"),
+            # player info
+            pl.col("person_id").cast(pl.String).cast(pl.Categorical),
             # team info
-            pl.when(pl.col("abbreviation").eq(pl.col("HOME")))
+            pl.when(pl.col("abbreviation").eq(pl.col("home")))
             .then(pl.lit("HOME"))
             .otherwise(pl.lit("AWAY"))
             .cast(pl.Categorical)
             .alias("team"),
-            # player info
-            pl.col("personId").cast(pl.String).cast(pl.Categorical),
             # time
             pl.col("clock").str.slice(2, 2).str.to_decimal() * 60
             + pl.col("clock").str.slice(5, 5).str.to_decimal(),
             pl.col("period").cast(pl.String).cast(pl.Categorical),
             # action type
-            pl.col("actionType").cast(pl.Categorical),
-            pl.col("subType").cast(pl.Categorical),
-            pl.col("shotResult").cast(pl.Categorical),
+            pl.col("action_type").cast(pl.Categorical),
+            pl.col("sub_type").cast(pl.Categorical),
+            pl.col("shot_result").cast(pl.Categorical),
             # shot location / distance
-            pl.when(pl.col("shotResult").is_null())
+            pl.when(pl.col("shot_result").is_null())
             .then(None)
-            .otherwise(pl.col("xLegacy"))
+            .otherwise(pl.col("x_legacy"))
             .alias("x"),
-            pl.when(pl.col("shotResult").is_null())
+            pl.when(pl.col("shot_result").is_null())
             .then(None)
-            .otherwise(pl.col("yLegacy"))
+            .otherwise(pl.col("y_legacy"))
             .alias("y"),
-            pl.col("shotDistance"),
+            pl.col("shot_distance"),
         )
     )
 
@@ -204,6 +209,7 @@ def scrape(delay: float = 0.6, verbose: bool = False, n_games: Union[int, None] 
 def clean(
     n_games: Union[None, int] = None,
     outfile=str(DATA_DIRECTORY / "pbp-clean" / "{n_games}.parquet"),
+    verbose: bool = False,
 ):
     pbp = load_raw_pbp(n_games=n_games)
     games = get_game_df()
@@ -215,7 +221,7 @@ def clean(
 
     s = Status("Writing output...")
     s.start()
-    outfile = outfile.format(n_games=pbp["gameId"].unique().len())
+    outfile = outfile.format(n_games=pbp["game_id"].unique().len())
     dir, _ = outfile.rsplit("/", maxsplit=1)
     os.makedirs(dir, exist_ok=True)
     pbp.write_parquet(outfile)
@@ -224,6 +230,9 @@ def clean(
     print(
         f"[green][b]:heavy_check_mark:[/b][/green] Cleaned play-by-play written to [blue][b]{outfile}"
     )
+
+    if verbose:
+        print(pbp)
 
 
 if __name__ == "__main__":
