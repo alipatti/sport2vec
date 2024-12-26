@@ -37,12 +37,12 @@ def get_game_df() -> pl.DataFrame:
     except FileNotFoundError:
         pass
 
-    games_by_team = [
+    games_by_team: list[pl.DataFrame] = [
         pl.from_pandas(LeagueGameFinder(team_id_nullable=id).get_data_frames()[0])
         for id in track(TEAMS["id"], description="Fetching games by team")
     ]
 
-    games: pl.DataFrame = (
+    games = (
         pl.concat(games_by_team, how="vertical_relaxed")
         .with_columns(
             pl.col("GAME_DATE").str.to_date().alias("DATE"),
@@ -66,9 +66,10 @@ def get_game_df() -> pl.DataFrame:
             "DATE",
             "HOME",
             "AWAY",
-            pl.col("GAME_ID").alias("ID"),
+            pl.col("GAME_ID"),
             "SEASON_YEAR",
         )
+        .rename(lambda col: col.lower())
     )
 
     print(f"Found {len(games)} games with play-by-play data")
@@ -100,10 +101,10 @@ def scrape_raw_pbp(
         games.rows(named=True),
         description=f"Scraping pbp from {len(games)} games...",
     ):
-        id = game["ID"]
-        game_name = f"{game['HOME']} vs. {game['AWAY']} ({str(game['DATE'])})"
+        id = game["game_id"]
+        game_name = f"{game['home']} vs. {game['away']} ({str(game['date'])})"
 
-        cache_path = DATA_DIRECTORY / "pbp-raw" / (f"{id}.parquet")
+        cache_path = DATA_DIRECTORY / "pbp-raw" / f"{id}.parquet"
 
         if os.path.exists(cache_path):
             if verbose:
@@ -148,26 +149,39 @@ def load_raw_pbp(n_games: int | None = None) -> pl.LazyFrame:
 
 def clean_raw_pbp(raw_pbp: pl.LazyFrame, games: pl.DataFrame) -> pl.DataFrame:
     df = (
-        raw_pbp.join(games.lazy(), left_on="gameId", right_on="ID")
-        .join(TEAMS.lazy(), left_on="teamId", right_on="id")
-        .join(PLAYERS.lazy(), left_on="personId", right_on="id")
-        .with_columns(
-            pl.col(pl.String)
-            .replace(["", " ", "Unknown"], None)
-            .str.to_uppercase()
-            .str.replace_all(" |-", "_")
-        )
+        raw_pbp.join(games.lazy(), left_on="gameId", right_on="game_id")
+        .join(TEAMS.lazy(), left_on="teamId", right_on="id", how="left")
+        # .join(PLAYERS.lazy(), left_on="personId", right_on="id", how="left")
         .rename(inflection.underscore)
-        .filter(pl.col("action_type") != "period")
+        .with_columns(
+            # clean up string cols
+            pl.col(pl.String)
+            .str.strip_chars()
+            .replace("", None)
+            .str.to_uppercase()
+            .str.replace_all("[ -]+", "_"),
+        )
         .select(
             # game info
-            pl.col("game_id"),
+            pl.col("game_id").cast(pl.Categorical),
             # player info
-            pl.col("person_id").cast(pl.String).cast(pl.Categorical),
+            pl.col("person_id").replace(0, None).cast(pl.String).cast(pl.Categorical),
             # team info
-            pl.when(pl.col("abbreviation").eq(pl.col("home")))
-            .then(pl.lit("HOME"))
-            .otherwise(pl.lit("AWAY"))
+            pl.when(pl.col("action_type").ne("TIMEOUT"))
+            .then(
+                # use info from the team abbreviation column
+                pl.when(pl.col("abbreviation").eq(pl.col("home")))
+                .then(pl.lit("HOME"))
+                .when(pl.col("abbreviation").eq(pl.col("away")))
+                .then(pl.lit("AWAY"))
+                .otherwise(None)
+            )
+            .otherwise(
+                # team abbreviation not provided. have to pull from the event description
+                pl.when(pl.col("description").str.contains(r"^[A-Z]*\s"))
+                .then(pl.lit("HOME"))
+                .otherwise(pl.lit("HOME"))
+            )
             .cast(pl.Categorical)
             .alias("team"),
             # time
@@ -187,7 +201,7 @@ def clean_raw_pbp(raw_pbp: pl.LazyFrame, games: pl.DataFrame) -> pl.DataFrame:
             .then(None)
             .otherwise(pl.col("y_legacy"))
             .alias("y"),
-            pl.col("shot_distance"),
+            pl.col("shot_distance").replace(0, None),
         )
     )
 
@@ -209,30 +223,34 @@ def scrape(delay: float = 0.6, verbose: bool = False, n_games: Union[int, None] 
 def clean(
     n_games: Union[None, int] = None,
     outfile=str(DATA_DIRECTORY / "pbp-clean" / "{n_games}.parquet"),
-    verbose: bool = False,
+    print_output: bool = False,
+    write_output: bool = True,
 ):
-    pbp = load_raw_pbp(n_games=n_games)
+    raw = load_raw_pbp(n_games=n_games)
     games = get_game_df()
 
     s = Status("Cleaning pbp...")
     s.start()
-    pbp = clean_raw_pbp(pbp, games)
+    clean = clean_raw_pbp(raw, games)
     s.stop()
 
-    s = Status("Writing output...")
-    s.start()
-    outfile = outfile.format(n_games=pbp["game_id"].unique().len())
-    dir, _ = outfile.rsplit("/", maxsplit=1)
-    os.makedirs(dir, exist_ok=True)
-    pbp.write_parquet(outfile)
-    s.stop()
+    if write_output:
+        s = Status("Writing output...")
+        s.start()
+        outfile = outfile.format(n_games=clean["game_id"].unique().len())
+        dir, _ = outfile.rsplit("/", maxsplit=1)
+        os.makedirs(dir, exist_ok=True)
+        clean.write_parquet(outfile)
+        s.stop()
 
-    print(
-        f"[green][b]:heavy_check_mark:[/b][/green] Cleaned play-by-play written to [blue][b]{outfile}"
-    )
+        print(
+            f"[green][b]:heavy_check_mark:[/b][/green] Cleaned play-by-play written to [blue][b]{outfile}"
+        )
 
-    if verbose:
-        print(pbp)
+    if print_output:
+        print(clean)
+
+    return clean
 
 
 if __name__ == "__main__":
