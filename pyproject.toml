@@ -8,10 +8,20 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "inflection>=0.5.1",
     "nba-api>=1.10.0",
     "polars>=1.30.0",
+    "polars-cache>=0.1.10",
+    "pyarrow>=20.0.0",
+    "rich>=14.0.0",
+    "typer>=0.16.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ipython>=9.3.0",
+]

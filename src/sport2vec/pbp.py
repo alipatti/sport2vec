@@ -1,19 +1,18 @@
 import os
 import time
 from pathlib import Path
-from typing import Union
-from hashlib import sha3_256
-
 import datetime
+
 from nba_api.stats.endpoints import PlayByPlayV3, LeagueGameFinder
 from nba_api.stats.static.teams import get_teams
 from nba_api.stats.static.players import get_players
 import polars as pl
-import typer
+from polars_cache import cache
 from rich.progress import track
-from rich.status import Status
 from rich import print
 import inflection
+
+from sport2vec.helpers import rate_limit
 
 
 DATA_DIRECTORY = Path("data")
@@ -21,67 +20,61 @@ DATA_DIRECTORY = Path("data")
 TEAMS = pl.from_dicts(get_teams())
 PLAYERS = pl.from_dicts(get_players())
 
-app = typer.Typer()
+
+class Filters:
+    BETWEEN_NBA_TEAMS = pl.col("home").is_in(TEAMS["abbreviation"]) & pl.col(
+        "away"
+    ).is_in(TEAMS["abbreviation"])
+    HOME_ONLY = pl.col("vs_or_at") == "vs."  # so we don't double-count
+    PBP_ONLY = pl.col("season") >= 1996  # PBP exists for 1996 onwards
+    GAME_COMPLETE = pl.col("wl").is_in(("W", "L"))
+
+
+@cache(expires_after=datetime.timedelta(days=1), verbose=0)
+def _raw_game_df() -> pl.DataFrame:
+    games_by_team: list[pl.DataFrame] = [
+        pl.from_pandas(LeagueGameFinder(team_id_nullable=id).get_data_frames()[0])
+        for id in rate_limit(track(TEAMS["id"], description="Fetching games by team"))
+    ]
+
+    return pl.concat(games_by_team, how="vertical_relaxed")
 
 
 def get_game_df() -> pl.DataFrame:
-    team_abbreviations = TEAMS["abbreviation"].to_list()
-    cache_path = DATA_DIRECTORY / "games" / f"{datetime.date.today()}.parquet"
-
-    try:
-        os.makedirs(DATA_DIRECTORY / "games", exist_ok=True)
-        df = pl.read_parquet(cache_path)
-        print(f"Loading cached game list from {cache_path}")
-        return df
-
-    except FileNotFoundError:
-        pass
-
-    games_by_team: list[pl.DataFrame] = [
-        pl.from_pandas(LeagueGameFinder(team_id_nullable=id).get_data_frames()[0])
-        for id in track(TEAMS["id"], description="Fetching games by team")
-    ]
-
-    games = (
-        pl.concat(games_by_team, how="vertical_relaxed")
+    return (
+        _raw_game_df()
+        .rename(inflection.underscore)
         .with_columns(
-            pl.col("GAME_DATE").str.to_date().alias("DATE"),
-            pl.col("MATCHUP").str.split(" ").list.to_struct().alias("MATCHUP_SPLIT"),
-            pl.col("SEASON_ID").str.slice(-4).str.to_integer().alias("SEASON_YEAR"),
+            pl.col("matchup")
+            .str.split(" ")
+            .list.to_struct(fields=("home", "vs_or_at", "away"))
+            .struct.unnest(),
         )
-        .unnest("MATCHUP_SPLIT")
-        .rename({"field_0": "HOME", "field_2": "AWAY"})
         .filter(
-            pl.col("SEASON_YEAR") >= 1996,  # PBP exists for 1996 onwards
-            pl.col("field_1") == "vs.",  # drop away games
-            pl.col("HOME").is_in(team_abbreviations),
-            pl.col("AWAY").is_in(team_abbreviations),  # only between NBA teams
+            # Filters.PBP_ONLY,
+            Filters.HOME_ONLY,
+            Filters.BETWEEN_NBA_TEAMS,
+            Filters.GAME_COMPLETE,
         )
-        .drop("field_1")
-        .drop_nulls("WL")  # drop in-progress games
-        .unique("GAME_ID")  # count each game only once
-        .sort("GAME_DATE")  # sort by date
-        .reverse()
         .select(
-            "DATE",
-            "HOME",
-            "AWAY",
-            pl.col("GAME_ID"),
-            "SEASON_YEAR",
+            pl.col("game_date").str.to_date().alias("date"),
+            "home",
+            "away",
+            pl.when(wl="W").then("home").when(wl="L").then("away").alias("winner"),
+            pl.col("game_id"),
+            pl.col("season_id").str.slice(-4).str.to_integer().alias("season"),
         )
-        .rename(lambda col: col.lower())
+        .sort("date", descending=True)
     )
 
-    print(f"Found {len(games)} games with play-by-play data")
 
-    games.write_parquet(cache_path)
-
-    return games
+def _scrape_game(game_id: int) -> pl.LazyFrame:
+    df = pl.from_pandas(PlayByPlayV3(id).get_data_frames()[0])
 
 
 def scrape_raw_pbp(
     games: pl.DataFrame,
-    delay,
+    delay_ms: int = 250,
     verbose=False,
     retry_failed=False,
 ):
@@ -97,9 +90,12 @@ def scrape_raw_pbp(
 
     failed_set = failed_file.read().split()
 
-    for game in track(
-        games.rows(named=True),
-        description=f"Scraping pbp from {len(games)} games...",
+    for game in rate_limit(
+        track(
+            games.rows(named=True),
+            description=f"Scraping pbp from {len(games)} games...",
+        ),
+        delay_ms=delay_ms,
     ):
         id = game["game_id"]
         game_name = f"{game['home']} vs. {game['away']} ({str(game['date'])})"
@@ -128,8 +124,6 @@ def scrape_raw_pbp(
 
             if verbose:
                 print(f"[red][b]Failed:[/b][/red] {game_name}")
-
-        time.sleep(delay)
 
     failed_file.close()
 
@@ -206,52 +200,3 @@ def clean_raw_pbp(raw_pbp: pl.LazyFrame, games: pl.DataFrame) -> pl.DataFrame:
     )
 
     return df.collect()
-
-
-@app.command()
-def scrape(delay: float = 0.6, verbose: bool = False, n_games: Union[int, None] = None):
-    games = get_game_df()
-
-    scrape_raw_pbp(
-        games.head(n_games) if n_games else games,
-        delay=delay,
-        verbose=verbose,
-    )
-
-
-@app.command()
-def clean(
-    n_games: Union[None, int] = None,
-    outfile=str(DATA_DIRECTORY / "pbp-clean" / "{n_games}.parquet"),
-    print_output: bool = False,
-    write_output: bool = True,
-):
-    raw = load_raw_pbp(n_games=n_games)
-    games = get_game_df()
-
-    s = Status("Cleaning pbp...")
-    s.start()
-    clean = clean_raw_pbp(raw, games)
-    s.stop()
-
-    if write_output:
-        s = Status("Writing output...")
-        s.start()
-        outfile = outfile.format(n_games=clean["game_id"].unique().len())
-        dir, _ = outfile.rsplit("/", maxsplit=1)
-        os.makedirs(dir, exist_ok=True)
-        clean.write_parquet(outfile)
-        s.stop()
-
-        print(
-            f"[green][b]:heavy_check_mark:[/b][/green] Cleaned play-by-play written to [blue][b]{outfile}"
-        )
-
-    if print_output:
-        print(clean)
-
-    return clean
-
-
-if __name__ == "__main__":
-    app()
