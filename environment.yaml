@@ -1,9 +1,0 @@
-name: sport2vec
-
-channels:
-  - conda-forge
-  - defaults
-
-dependencies:
-  - pip:
-      - nba-api==1.4.1
