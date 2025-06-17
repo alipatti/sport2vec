@@ -13,6 +13,7 @@ dependencies = [
     "polars>=1.30.0",
     "polars-cache>=0.1.10",
     "pyarrow>=20.0.0",
+    "requests-cache>=1.2.1",
     "rich>=14.0.0",
     "typer>=0.16.0",
 ]
@@ -24,4 +25,5 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "ipython>=9.3.0",
+    "matplotlib>=3.10.3",
 ]
