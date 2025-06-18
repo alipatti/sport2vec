@@ -2,74 +2,49 @@ from typing import Collection
 
 from nba_api.stats.static.teams import get_teams
 from nba_api.stats.static.players import get_players
-import requests
 import requests_cache
 import polars as pl
 from polars import selectors as cs
 from rich.progress import track
 import inflection
 
-from sport2vec import API_DELAY_MS, API_URL, HEADERS
+from sport2vec.api import api_requests
 from sport2vec.games import all_games
-from sport2vec.helpers import rate_limit
 
 TEAMS = pl.from_dicts(get_teams())
 PLAYERS = pl.from_dicts(get_players())
 
 
-def _single_game_raw_pbp(
-    game_id: str,
-) -> tuple[bool, pl.DataFrame | None]:
-    endpoint = "playbyplayv3"
-
-    params = {
-        "EndPeriod": 0,
-        "GameID": game_id,
-        "StartPeriod": 0,
-    }
-
-    try:
-        with requests.get(API_URL + endpoint, params=params, headers=HEADERS) as r:
-            data = r.json()["game"]
-            from_cache = getattr(r, "from_cache", False)
-
-    except (TimeoutError, KeyError):
-        return (False, None)
-
-    df = pl.from_records(data["actions"]).with_columns(
-        game_id=pl.lit(data["gameId"], dtype=pl.Categorical(ordering="lexical"))
-    )
-    # except:
-    #   return (from_cache, None)
-
-    return (from_cache, df)
-
-
-def _raw_pbp(game_ids: Collection[str]):
+def raw_pbp(game_ids: Collection[str]):
     ids = track(
         game_ids,
-        description=f"Scraping pbp from {len(game_ids)} games...",
+        description=f"Fetching play-by-play for {len(game_ids)} games...",
         transient=True,
+    )
+
+    request_params = (
+        {
+            "EndPeriod": 0,
+            "GameID": id,
+            "StartPeriod": 0,
+        }
+        for id in ids
     )
 
     return pl.concat(
         (
-            df
-            for _, df in rate_limit(
-                map(_single_game_raw_pbp, ids),
-                delay_ms=API_DELAY_MS,
-                # don't throttle when using cache
-                limit_when=lambda x: not x[0],
+            pl.from_records(json["game"]["actions"]).with_columns(
+                game_id=pl.lit(
+                    json["game"]["gameId"], dtype=pl.Categorical(ordering="lexical")
+                )
             )
-            if df is not None
+            for json in api_requests("playbyplayv3", request_params)
         ),
         how="diagonal_relaxed",
     )
 
 
-def clean_pbp(game_ids: Collection[str]) -> pl.DataFrame:
-    raw = _raw_pbp(game_ids)
-
+def clean_pbp(raw: pl.DataFrame) -> pl.DataFrame:
     event_type = (
         pl.col("action_type")
         .replace(
@@ -190,4 +165,4 @@ if __name__ == "__main__":
     games = all_games()
     game_ids = games.get_column("game_id").head(1000)
 
-    plays = clean_pbp(game_ids)
+    plays = raw_pbp(game_ids).pipe(clean_pbp)

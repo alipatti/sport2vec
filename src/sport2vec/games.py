@@ -1,10 +1,8 @@
-from typing import Optional
 import inflection
 import polars as pl
-import requests
+from rich.progress import track
 
-from sport2vec import API_DELAY_MS, API_URL, HEADERS
-from sport2vec.helpers import rate_limit
+from sport2vec.api import api_requests
 
 
 class Filters:
@@ -25,43 +23,23 @@ def _seasons(start: int, end: int) -> list[str]:
     return regular_seasons + postseasons
 
 
-def _single_season_raw_games(season: str) -> tuple[bool, Optional[pl.DataFrame]]:
-    endpoint = "leaguegamefinder"
-    params = {"Season": season}
-
-    try:
-        with requests.get(API_URL + endpoint, params=params, headers=HEADERS) as r:
-            data = r.json()["resultSets"][0]
-            from_cache = getattr(r, "from_cache", False)
-
-    except TimeoutError:
-        return (False, None)
-
-    print(season, len(data["rowSet"]), from_cache)
-
-    df = pl.from_records(
-        data["rowSet"],
-        schema=data["headers"],
-        orient="row",
-        infer_schema_length=500,
-    )
-
-    return from_cache, df
-
-
 def _raw_games(start_year: int = 1983, end_year: int = 2025) -> pl.DataFrame:
-    seasons = _seasons(start_year, end_year)
+    seasons = track(
+        _seasons(start_year, end_year),
+        description=f"Fetching games from {start_year} through {end_year}...",
+        transient=True,
+    )
+    params = ({"Season": season} for season in seasons)
 
     return pl.concat(
         (
-            df
-            for _, df in rate_limit(
-                map(_single_season_raw_games, seasons),
-                delay_ms=API_DELAY_MS,
-                # don't throttle when using cache
-                limit_when=lambda x: not x[0],
+            pl.from_records(
+                json["resultSets"][0]["rowSet"],
+                schema=json["resultSets"][0]["headers"],
+                orient="row",
+                infer_schema_length=500,
             )
-            if df is not None
+            for json in api_requests("leaguegamefinder", params)
         ),
         how="diagonal_relaxed",
     )
