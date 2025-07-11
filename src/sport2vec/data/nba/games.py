@@ -2,7 +2,7 @@ import inflection
 import polars as pl
 from rich.progress import track
 
-from sport2vec.api import api_requests
+from sport2vec.data.nba import NBA_API
 
 
 class Filters:
@@ -39,7 +39,7 @@ def _raw_games(start_year: int = 1983, end_year: int = 2025) -> pl.DataFrame:
                 orient="row",
                 infer_schema_length=500,
             )
-            for json in api_requests("leaguegamefinder", params)
+            for json in NBA_API.requests("leaguegamefinder", params)
         ),
         how="diagonal_relaxed",
     )
